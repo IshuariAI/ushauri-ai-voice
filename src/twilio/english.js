@@ -1,426 +1,289 @@
 const VoiceResponse = require("twilio").twiml.VoiceResponse;
 const axios = require("axios");
+const { v4: uuidv4 } = require("uuid");
 
-const conversations = {};
-const pendingRequests = {};
+// In-memory storage for conversations (consider using Redis or a database for production)
+const conversations = new Map();
+
+// Cleanup stale conversations every 30 minutes
+const CLEANUP_INTERVAL = 30 * 60 * 1000; // 30 minutes
+const CONVERSATION_TIMEOUT = 60 * 60 * 1000; // 1 hour
+
+// Helper function to handle long responses
+function speakLongResponse(twiml, response) {
+  const MAX_CHUNK_LENGTH = 400;
+
+  if (response.length <= MAX_CHUNK_LENGTH) {
+    twiml.say({ voice: "alice", language: "en-US" }, response);
+    return;
+  }
+
+  let chunks = [];
+  let currentChunk = "";
+
+  // Split by sentences to maintain natural speech breaks
+  const sentences = response.split(/(?<=[.!?])\s+/);
+
+  for (const sentence of sentences) {
+    if (currentChunk.length + sentence.length > MAX_CHUNK_LENGTH) {
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+        currentChunk = sentence;
+      } else {
+        // If a single sentence is longer than MAX_CHUNK_LENGTH, split it further
+        let remainingSentence = sentence;
+        while (remainingSentence.length > MAX_CHUNK_LENGTH) {
+          chunks.push(remainingSentence.substring(0, MAX_CHUNK_LENGTH));
+          remainingSentence = remainingSentence.substring(MAX_CHUNK_LENGTH);
+        }
+        currentChunk = remainingSentence;
+      }
+    } else {
+      currentChunk += (currentChunk.length > 0 ? " " : "") + sentence;
+    }
+  }
+
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  for (const chunk of chunks) {
+    twiml.say({ voice: "alice", language: "en-US" }, chunk);
+    // Add a small pause between chunks for more natural speech
+    twiml.pause({ length: 1 });
+  }
+}
 
 function setupEnglishBot(app) {
-  app.post("/english-voice", async (req, res) => {
-    console.log("\n==========================\n");
-    console.log("# NEW CALL STARTED");
-    console.log("\n==========================\n");
+  // Start conversation
+  app.post("/english-voice", (req, res) => {
+    console.log("English voice call received");
 
     const twiml = new VoiceResponse();
-    const callSid = req.body.CallSid;
+    const conversationId = uuidv4();
 
-    console.log(`# New English call received: ${callSid}`);
-
-    conversations[callSid] = {
-      messages: [],
-      lastUpdated: Date.now(),
-      counter: 0,
-    };
-
-    twiml.say(
-      {
-        voice: "alice",
-        language: "en-US",
-      },
-      "Welcome to the Ushauri Legal Assistant. How may I help you today?"
-    );
-
-    twiml.record({
-      action: "/english-wait-for-transcription",
-      maxLength: 60,
-      timeout: 2,
-      transcribe: true,
-      transcribeCallback: "/english-transcription",
-      playBeep: true,
+    // Store new conversation
+    conversations.set(conversationId, {
+      id: conversationId,
+      lastActivity: Date.now(),
+      history: [],
     });
 
-    console.log(`# Active conversations: ${Object.keys(conversations).length}`);
-    console.log(`# Pending requests: ${Object.keys(pendingRequests).length}`);
+    // Initial greeting
+    twiml.say(
+      { voice: "alice", language: "en-US" },
+      "Hello, I'm Ushauri AI, your personal health advisor. How can I assist you today?"
+    );
+
+    // Gather user's speech input
+    const gather = twiml.gather({
+      input: "speech",
+      action: `/english-transcription?conversationId=${conversationId}`,
+      method: "POST",
+      speechTimeout: "auto",
+      language: "en-US",
+    });
+
+    // Handle no response
+    twiml.say(
+      { voice: "alice", language: "en-US" },
+      "I didn't hear anything. Please call back when you're ready to speak."
+    );
+    twiml.hangup();
 
     res.type("text/xml");
     res.send(twiml.toString());
   });
 
-  app.post("english-transcription", async (req, res) => {
-    res.sendStatus(200);
-    const callSid = req.body.CallSid;
-    const transcriptionStatus = req.body.TranscriptionStatus;
-    const transcriptionText = req.body.TranscriptionText;
+  // Process speech transcription
+  app.post("/english-transcription", async (req, res) => {
+    console.log("Transcription endpoint hit");
+    const twiml = new VoiceResponse();
+    const conversationId = req.query.conversationId;
+    const speechResult = req.body.SpeechResult;
 
-    console.log("\n==========================\n");
-    console.log("# TRANSCRIPTION RECEIVED");
-    console.log("\n==========================\n");
-    console.log(`# Transcription for call ${callSid}: ${transcriptionStatus}`);
-
-    console.log(`# All transcription data:`);
-    console.log(req.body, null, 2);
-
-    if (transcriptionStatus === "completed" && transcriptionText) {
-      console.log(`# TRANSCRIBED TEXT: ${transcriptionText}`);
-
-      if (pendingRequests[callSid]) {
-        console.log(
-          `# Found pending request for call ${callSid}, processing with trascription`
-        );
-
-        const turnNumber = pendingRequests[callSid].turnNumber;
-
-        conversations[callSid].lastUpdated = Date.now();
-        conversations[callSid].messages.push({
-          role: "user",
-          content: transcriptionText,
-        });
-
-        console.log(`# Calling AI service for response - Turn ${turnNumber}`);
-        let aiResponse;
-
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => {
-            controller.abort();
-          }, 7000);
-
-          const response = await axios.post(
-            process.env.RENDER_ENDPOINT,
-            {
-              text: transcriptionText,
-              conversations: conversations[callSid].messages.slice(-4),
-            },
-            { signal: controller.signal }
-          );
-          clearTimeout(timeoutId);
-
-          if (response.data && response.data.answer) {
-            aiResponse = response.data.answer;
-          } else {
-            console.warn("# No answer found in AI response");
-            aiResponse = "Sorry, I didn't get that. Can you repeat?";
-          }
-        } catch (error) {
-          console.error("# Error calling AI service:", error);
-          aiResponse = "Sorry, I didn't get that. Can you repeat?";
-        }
-        console.log(`# AI response: ${aiResponse.substring(0, 100)}...`);
-
-        conversations[callSid].messages.push({
-          role: "assistant",
-          content: aiResponse,
-        });
-
-        pendingRequests[callSid].aiResponse = aiResponse;
-        pendingRequests[callSid].ready = true;
-        pendingRequests[callSid].processedAt = Date.now();
-        console.log(`# Response for call ${callSid}`);
-
-        console.log("\n Current pending requests status:");
-        for (const sid in pendingRequests) {
-          console.log(
-            `${sid}: ready=${pendingRequests[sid].ready}, failed=${pendingRequests[sid].failed}`
-          );
-        }
-      } else {
-        console.log(
-          `# No pending request for call ${callSid}, storing transcription`
-        );
-
-        pendingRequests[callSid] = {
-          turnNumber: conversations[callSid]
-            ? conversations[callSid].counter + 1
-            : 1,
-          transcriptionText,
-          ready: false,
-          createdAt: Date.now(),
-        };
-      }
-    } else if (transcriptionStatus === "failed") {
-      console.log(`# Transcription failed for call ${callSid}`);
-
-      if (pendingRequests[callSid]) {
-        pendingRequests[callSid].failed = true;
-        pendingRequests[callSid].failedAt = Date.now();
-        console.log(`# Marking pending request for call ${callSid} as failed`);
-      }
-    } else {
-      console.log(
-        `# Non-complete transcription status for call ${callSid}: ${transcriptionStatus}`
+    if (!conversationId || !conversations.has(conversationId)) {
+      twiml.say(
+        { voice: "alice", language: "en-US" },
+        "I'm sorry, but I can't find your conversation. Please call again."
       );
+      twiml.hangup();
+
+      res.type("text/xml");
+      res.send(twiml.toString());
+      return;
     }
+
+    const conversation = conversations.get(conversationId);
+    conversation.lastActivity = Date.now();
+
+    if (!speechResult) {
+      twiml.say(
+        { voice: "alice", language: "en-US" },
+        "I'm sorry, I couldn't understand what you said. Could you please repeat that?"
+      );
+
+      const gather = twiml.gather({
+        input: "speech",
+        action: `/english-transcription?conversationId=${conversationId}`,
+        method: "POST",
+        speechTimeout: "auto",
+        language: "en-US",
+      });
+
+      res.type("text/xml");
+      res.send(twiml.toString());
+      return;
+    }
+
+    console.log(`User said: ${speechResult}`);
+
+    // Save user message to history
+    conversation.history.push({ role: "user", content: speechResult });
+
+    // Redirect to process the message with AI
+    twiml.redirect(
+      {
+        method: "POST",
+      },
+      `/english-check-transcription?conversationId=${conversationId}`
+    );
+
+    res.type("text/xml");
+    res.send(twiml.toString());
   });
 
-  app.post("/english-wait-for-transcription", (req, res) => {
-    console.log("\n==========================\n");
-    console.log("# WAIT FOR TRANSCRIPTION");
-    console.log("\n==========================\n");
+  // Process AI response
+  app.post("/english-check-transcription", async (req, res) => {
+    console.log("Processing transcription with AI");
     const twiml = new VoiceResponse();
-    const callSid = req.body.CallSid;
+    const conversationId = req.query.conversationId;
+
+    if (!conversationId || !conversations.has(conversationId)) {
+      twiml.say(
+        { voice: "alice", language: "en-US" },
+        "I'm sorry, but there was an error with your conversation. Please call again."
+      );
+      twiml.hangup();
+
+      res.type("text/xml");
+      res.send(twiml.toString());
+      return;
+    }
+
+    const conversation = conversations.get(conversationId);
+    conversation.lastActivity = Date.now();
 
     try {
-      if (!conversations[callSid]) {
-        conversations[callSid] = {
-          messages: [],
-          lastUpdated: Date.now(),
-          counter: 0,
-        };
-      }
+      // Get AI response from the Render endpoint
+      const aiResponse = await getAIResponse(conversation.history);
 
-      conversations[callSid].counter++;
-      const turnNumber = conversations[callSid].counter;
-      console.log(
-        `# Turn number: ${turnNumber}, Waiting for transcription for call ${callSid}`
-      );
+      // Save AI response to history
+      conversation.history.push({ role: "assistant", content: aiResponse });
 
-      pendingRequests[callSid] = {
-        turnNumber,
-        ready: false,
-        createdAt: Date.now(),
-      };
+      // Speak the AI response
+      speakLongResponse(twiml, aiResponse);
 
-      console.log(`# Created pending request for call ${callSid}`);
-
+      // Ask if the user has more questions
+      twiml.pause({ length: 1 });
       twiml.say(
-        {
-          voice: "alice",
-          language: "en-US",
-        },
-        `/english-check-transcription?poll=1&maxPolls=40`
-      );
-      res.type("text/xml");
-      res.send(twiml.toString());
-    } catch (error) {
-      console.error(
-        `# Error processing transcription for call ${callSid}: ${error.message}`
-      );
-      console.error(error.stack);
-
-      twiml.say(
-        {
-          voice: "alice",
-          language: "en-US",
-        },
-        "I apologize for the technical issue. Please repeat your question after the beep"
+        { voice: "alice", language: "en-US" },
+        "Do you have any other questions?"
       );
 
-      twiml.record({
-        action: "/english-wait-for-transcription",
-        maxLength: 60,
-        timeout: 2,
-        transcribe: true,
-        transcribeCallback: "/english-transcription",
-        maxSilence: 5,
-        playBeep: true,
+      // Gather the next user input
+      const gather = twiml.gather({
+        input: "speech",
+        action: `/english-transcription?conversationId=${conversationId}`,
+        method: "POST",
+        speechTimeout: "auto",
+        language: "en-US",
       });
-      res.type("text/xml");
-      res.send(twiml.toString());
+
+      // If they don't respond
+      twiml.say(
+        { voice: "alice", language: "en-US" },
+        "Thank you for using Ushauri AI. Goodbye!"
+      );
+      twiml.hangup();
+    } catch (error) {
+      console.error("Error processing AI response:", error);
+
+      twiml.say(
+        { voice: "alice", language: "en-US" },
+        "I'm sorry, but I encountered an error processing your question. Let's try again."
+      );
+
+      const gather = twiml.gather({
+        input: "speech",
+        action: `/english-transcription?conversationId=${conversationId}`,
+        method: "POST",
+        speechTimeout: "auto",
+        language: "en-US",
+      });
     }
+
+    res.type("text/xml");
+    res.send(twiml.toString());
   });
 
-  app.post(
-    "/english-check-transcription",
-    (req, res) => {
-      const twiml = new VoiceResponse();
-      const callSid = req.body.CallSid;
-      const currentPoll = req.body.poll || "1";
-      const maxPolls = req.query.maxPolls || "40";
+  // Function to get AI response from the Render endpoint
+  async function getAIResponse(history) {
+    try {
+      console.log("Sending request to:", process.env.RENDER_ENDPOINT);
 
-      console.log(`# Poll attempt ${currentPoll} for call ${callSid}`);
-
-      try {
-        if (
-          pendingRequests[callSid] &&
-          pendingRequests[callSid].ready &&
-          pendingRequests[callSid].aiResponse
-        ) {
-          console.log(`# Response is ready for call ${callSid}`);
-          const aiResponse = pendingRequests[callSid].aiResponse;
-          speakLongResponse(twiml, aiResponse);
-          delete pendingRequests[callSid];
-          twiml.pause({ length: 1 });
-
-          const prompts = [
-            "Do you have a specific legal question? Please speak after the beep",
-          ];
-
-          const turnNumber = conversations[callSid]
-            ? conversations[callSid].counter
-            : 1;
-          const promptIndex = (turnNumber - 1) % prompts.length;
-          twiml.say(
-            { voice: "alice", language: "en-US" },
-            prompts[promptIndex]
-          );
-          twiml.record({
-            action: "/english-wait-for-transcription",
-            maxLength: 60,
-            timeout: 2,
-            transcribe: true,
-            transcribeCallback: "/english-transcription",
-            maxSilence: 5,
-            playBeep: true,
-          });
-        } else if (
-          pendingRequests[callSid] &&
-          pendingRequests[callSid].failed
-        ) {
-          console.warn(`# Transcription failed for call ${callSid}`);
-
-          twiml.say(
-            {
-              voice: "alice",
-              language: "en-US",
-            },
-            "I apologize for the technical issue. Please repeat your question after the beep"
-          );
-
-          delete pendingRequests[callSid];
-          twiml.record({
-            action: "/english-wait-for-transcription",
-            maxLength: 60,
-            timeout: 2,
-            transcribe: true,
-            transcribeCallback: "/english-transcription",
-            maxSilence: 5,
-            playBeep: true,
-          });
-        } else if (currentPoll >= maxPolls) {
-          console.warn(`# Max polls reached for call ${callSid}`);
-
-          twiml.say(
-            {
-              voice: "alice",
-              language: "en-US",
-            },
-            "I apologize for the technical issue. Please repeat your question after the beep"
-          );
-          delete pendingRequests[callSid];
-          twiml.record({
-            action: "/english-wait-for-transcription",
-            maxLength: 60,
-            timeout: 2,
-            transcribe: true,
-            transcribeCallback: "/english-transcription",
-            maxSilence: 5,
-            playBeep: true,
-          });
-        } else {
-          twiml.pause({ length: 1 });
-
-          if (currentPoll % 5 === 0) {
-            twiml.say(
-              {
-                voice: "alice",
-                language: "en-US",
-              },
-              "Still processing your question, continue to hold..."
-            );
-          }
-
-          twiml.redirect(
-            {
-              method: "POST",
-            },
-            `/english-check-transcription?poll=${
-              parseInt(currentPoll) + 1
-            }&maxPolls=${maxPolls}`
-          );
-          res.type("text/xml");
-          res.send(twiml.toString());
-        }
-      } catch (error) {
-        console.error(
-          `# Error processing transcription for call ${callSid}: ${error.message}`
-        );
-        console.error(error.stack);
-
-        twiml.say(
-          {
-            voice: "alice",
-            language: "en-US",
+      const response = await axios.post(
+        process.env.RENDER_ENDPOINT,
+        {
+          messages: history,
+          max_tokens: 400,
+          temperature: 0.7,
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
           },
-          "I apologize for the technical issue. Please repeat your question after the beep"
-        );
-
-        delete pendingRequests[callSid];
-        twiml.record({
-          action: "/english-wait-for-transcription",
-          maxLength: 60,
-          timeout: 2,
-          transcribe: true,
-          transcribeCallback: "/english-transcription",
-          maxSilence: 5,
-          playBeep: true,
-        });
-      }
-
-      app.get("/english-debug", (req, res) => {
-        const state = {
-          conversations: Object.keys(conversations).map((key) => ({
-            callSid: key,
-            turnCount: conversations[key].counter,
-            lastUpdated: conversations[key].lastUpdated,
-            messageCount: conversations[key].messages.length,
-          })),
-          pendingRequests: Object.keys(pendingRequests).map((key) => ({
-            callSid: key,
-            turnNumber: pendingRequests[key].turnNumber,
-            ready: pendingRequests[key].ready,
-            createdAt: pendingRequests[key].createdAt,
-            failed: pendingRequests[key].failed,
-          })),
-        };
-        res.json(state);
-      });
-
-      setInterval(() => {
-        const now = Date.now();
-
-        for (const callSid in pendingRequests) {
-          if (now - pendingRequests.createdAt > 300000) {
-            console.log(
-              `# Deleting pending request for call ${callSid} due to timeout`
-            );
-            delete pendingRequests[callSid];
-          }
         }
+      );
 
-        for (const callSid in conversations) {
-          if (now - conversations[callSid].lastUpdated > 300000) {
-            console.log(
-              `# Deleting conversation for call ${callSid} due to timeout`
-            );
-            delete conversations[callSid];
-          }
-        }
-      }, [300000]);
-      console.log(`# English bot setup complete`);
-    },
-    function speakLongResponse(twiml, response) {
-      const MAX_CHUNK_LENGTH = 400;
-
-      if (text.length <= MAX_CHUNK_LENGTH) {
-        twiml.say({ voice: "alice", language: "en-US" }, response);
-        return;
+      console.log("AI response received:", response.data);
+      return response.data.choices[0].message.content;
+    } catch (error) {
+      console.error("Error getting AI response:", error.message);
+      if (error.response) {
+        console.error("Response data:", error.response.data);
+        console.error("Response status:", error.response.status);
       }
+      return "I'm sorry, I'm having trouble connecting to my knowledge base right now. Please try again later.";
+    }
+  }
 
-      const sentences = response.match(/[^.!?]+[.!?]+/g) || [];
-      let currentChunk = "";
-
-      for (const sentence of sentences) {
-        if (currentChunk.length + sentence.length <= MAX_CHUNK_LENGTH) {
-          currentChunk += sentence;
-        } else {
-          twiml.say({ voice: "alice", language: "en-US" }, currentChunk);
-          currentChunk = sentence;
-        }
-      }
-
-      if (currentChunk) {
-        twiml.say({ voice: "alice", language: "en-US" }, currentChunk.trim());
+  // Setup cleanup interval outside the route handlers
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, conversation] of conversations.entries()) {
+      if (now - conversation.lastActivity > CONVERSATION_TIMEOUT) {
+        console.log(`Removing stale conversation: ${id}`);
+        conversations.delete(id);
       }
     }
-  );
+  }, CLEANUP_INTERVAL);
+
+  // Debug endpoint to view active conversations (secure this in production)
+  app.get("/debug/conversations", (req, res) => {
+    const conversationData = Array.from(conversations.entries()).map(
+      ([id, conversation]) => ({
+        id,
+        lastActivity: new Date(conversation.lastActivity).toISOString(),
+        messageCount: conversation.history.length,
+      })
+    );
+
+    res.json({
+      count: conversations.size,
+      conversations: conversationData,
+    });
+  });
 }
+
 module.exports = setupEnglishBot;

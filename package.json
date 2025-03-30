@@ -18,9 +18,11 @@
     "express": "^4.21.2",
     "form-data": "^4.0.2",
     "mongoose": "^8.13.1",
+    "morgan": "^1.10.0",
     "nodemon": "^3.1.9",
     "swagger-json": "^2.0.0",
     "swagger-ui-express": "^5.0.1",
-    "twilio": "^5.5.1"
+    "twilio": "^5.5.1",
+    "uuid": "^11.1.0"
   }
 }
