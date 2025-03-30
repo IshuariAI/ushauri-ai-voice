@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const connectDB = require("../db");
-const setupEnglishBot = require("../twilio/english");
+const connectDB = require("./config/db-config");
+const setupEnglishBot = require("./src/twilio/english");
 require("dotenv").config();
 
 const app = express();
